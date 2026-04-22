@@ -1,0 +1,15 @@
+# ============================================================
+# config-maps.yaml
+# FIX: Removed rabbitmq_amqp1_0 from plugins list.
+#      That plugin is NOT bundled in rabbitmq:3-management and
+#      causes RabbitMQ to crash on startup if listed.
+#      order-service and makeline-service use AMQP 0-9-1 (standard),
+#      NOT AMQP 1.0, so this plugin is not needed anyway.
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-enabled-plugins
+data:
+  rabbitmq_enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus].

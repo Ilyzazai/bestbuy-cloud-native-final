@@ -1,0 +1,624 @@
+# ============================================================
+# aps-all-in-one-Task2.yaml
+# Task 2: MongoDB HA (3 replicas + PVC) + RabbitMQ persistence
+# FIXES APPLIED:
+#   1. mongosh -> mongo in MongoDB liveness probe (mongo:4.2 uses mongo, not mongosh)
+#   2. makeline-service memory: 6Mi/20Mi -> 50Mi/128Mi (was OOMKilled)
+#   3. product-service memory: 1Mi/20Mi -> 50Mi/128Mi (was OOMKilled)
+# ============================================================
+
+# ---------------------------------------------------------------
+# MongoDB StatefulSet - 3 replicas + PersistentVolumeClaims
+# Each pod gets its own PVC so data survives pod restarts/deletions
+# Pods get stable DNS: mongodb-0.mongodb, mongodb-1.mongodb, mongodb-2.mongodb
+# ---------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+spec:
+  serviceName: mongodb
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: mongodb
+          image: mongo:4.2
+          ports:
+            - containerPort: 27017
+              name: mongodb
+          resources:
+            requests:
+              cpu: 5m
+              memory: 75Mi
+            limits:
+              cpu: 25m
+              memory: 1024Mi
+          livenessProbe:
+            exec:
+              command:
+                - mongo          # FIX 1: was "mongosh" — mongo:4.2 only has "mongo"
+                - --eval
+                - "db.runCommand('ping').ok"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: mongodb-data
+              mountPath: /data/db       # MongoDB default data directory
+  volumeClaimTemplates:                 # Kubernetes auto-creates one PVC per pod
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]  # One pod reads/writes per PVC
+        resources:
+          requests:
+            storage: 1Gi               # 1GB persistent disk per MongoDB replica
+---
+# Headless Service for MongoDB
+# clusterIP: None = headless, required for StatefulSet stable DNS names
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+spec:
+  clusterIP: None                       # Headless - enables DNS: mongodb-0.mongodb, etc.
+  ports:
+    - port: 27017
+  selector:
+    app: mongodb
+---
+# ---------------------------------------------------------------
+# RabbitMQ StatefulSet - with persistent storage
+# Without PVC, all queued messages are lost when pod restarts
+# ---------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management
+          ports:
+            - containerPort: 5672
+              name: rabbitmq-amqp
+            - containerPort: 15672
+              name: rabbitmq-http
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              value: "username"
+            - name: RABBITMQ_DEFAULT_PASS
+              value: "password"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: rabbitmq-enabled-plugins
+              mountPath: /etc/rabbitmq/enabled_plugins
+              subPath: enabled_plugins
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq   # RabbitMQ stores all messages/queues here
+      volumes:
+        - name: rabbitmq-enabled-plugins
+          configMap:
+            name: rabbitmq-enabled-plugins
+            items:
+              - key: rabbitmq_enabled_plugins
+                path: enabled_plugins
+  volumeClaimTemplates:                      # Auto-creates a PVC for RabbitMQ data
+    - metadata:
+        name: rabbitmq-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi                     # 1GB persistent disk for RabbitMQ messages
+---
+# Service for RabbitMQ
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: rabbitmq-amqp
+      port: 5672
+      targetPort: 5672
+    - name: rabbitmq-http
+      port: 15672
+      targetPort: 15672
+  type: ClusterIP
+---
+# Deployment for Order Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: order-service
+          image: ilyaszazai/order-service:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: ORDER_QUEUE_HOSTNAME
+              value: "rabbitmq"
+            - name: ORDER_QUEUE_PORT
+              value: "5672"
+            - name: ORDER_QUEUE_USERNAME
+              value: "username"
+            - name: ORDER_QUEUE_PASSWORD
+              value: "password"
+            - name: ORDER_QUEUE_NAME
+              value: "orders"
+            - name: FASTIFY_ADDRESS
+              value: "0.0.0.0"
+          resources:
+            requests:
+              cpu: 1m
+              memory: 50Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            failureThreshold: 5
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            failureThreshold: 5
+            initialDelaySeconds: 3
+            periodSeconds: 3
+      initContainers:
+        - name: wait-for-rabbitmq
+          image: busybox
+          command:
+            [
+              "sh",
+              "-c",
+              "until nc -zv rabbitmq 5672; do echo waiting for rabbitmq; sleep 2; done;",
+            ]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 50Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+---
+# Service for Order Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+  selector:
+    app: order-service
+---
+# Deployment for Makeline Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: makeline-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: makeline-service
+  template:
+    metadata:
+      labels:
+        app: makeline-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: makeline-service
+          image: ilyaszazai/makeline-service-l8:latest
+          ports:
+            - containerPort: 3001
+          env:
+            - name: ORDER_QUEUE_URI
+              value: "amqp://rabbitmq:5672"
+            - name: ORDER_QUEUE_USERNAME
+              value: "username"
+            - name: ORDER_QUEUE_PASSWORD
+              value: "password"
+            - name: ORDER_QUEUE_NAME
+              value: "orders"
+            - name: ORDER_DB_URI
+              value: "mongodb://mongodb:27017"
+            - name: ORDER_DB_NAME
+              value: "orderdb"
+            - name: ORDER_DB_COLLECTION_NAME
+              value: "orders"
+          resources:
+            requests:
+              cpu: 1m
+              memory: 50Mi   # FIX 2: was 6Mi — too low, caused OOMKill
+            limits:
+              cpu: 5m
+              memory: 128Mi  # FIX 2: was 20Mi — too low, caused OOMKill
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            failureThreshold: 10
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            failureThreshold: 5
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+# Service for Makeline Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: makeline-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3001
+      targetPort: 3001
+  selector:
+    app: makeline-service
+---
+# Deployment for Product Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-service
+  template:
+    metadata:
+      labels:
+        app: product-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: product-service
+          image: ilyaszazai/product-service:latest
+          ports:
+            - containerPort: 3002
+          env:
+            - name: AI_SERVICE_URL
+              value: "http://ai-service:5001/"
+          resources:
+            requests:
+              cpu: 1m
+              memory: 50Mi   # FIX 3: was 1Mi — way too low, caused OOMKill
+            limits:
+              cpu: 2m
+              memory: 128Mi  # FIX 3: was 20Mi — too low, caused OOMKill
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            failureThreshold: 5
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+# Service for Product Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3002
+      targetPort: 3002
+  selector:
+    app: product-service
+---
+# Deployment for Store Front
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-front
+  template:
+    metadata:
+      labels:
+        app: store-front
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: store-front
+          image: ilyaszazai/store-front:latest
+          ports:
+            - containerPort: 8080
+              name: store-front
+          env:
+            - name: VUE_APP_ORDER_SERVICE_URL
+              value: "http://order-service:3000/"
+            - name: VUE_APP_PRODUCT_SERVICE_URL
+              value: "http://product-service:3002/"
+          resources:
+            requests:
+              cpu: 1m
+              memory: 200Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 5
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+# Service for Store Front
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-front
+spec:
+  ports:
+    - port: 80
+      targetPort: 8080
+  selector:
+    app: store-front
+  type: LoadBalancer
+---
+# Deployment for Store Admin
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-admin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-admin
+  template:
+    metadata:
+      labels:
+        app: store-admin
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: store-admin
+          image: ilyaszazai/store-admin-l8:latest
+          ports:
+            - containerPort: 8081
+              name: store-admin
+          env:
+            - name: VUE_APP_PRODUCT_SERVICE_URL
+              value: "http://product-service:3002/"
+            - name: VUE_APP_MAKELINE_SERVICE_URL
+              value: "http://makeline-service:3001/"
+          resources:
+            requests:
+              cpu: 1m
+              memory: 200Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            failureThreshold: 5
+            initialDelaySeconds: 3
+            periodSeconds: 3
+---
+# Service for Store Admin
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-admin
+spec:
+  ports:
+    - port: 80
+      targetPort: 8081
+  selector:
+    app: store-admin
+  type: LoadBalancer
+---
+# Deployment for AI Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-service
+  template:
+    metadata:
+      labels:
+        app: ai-service
+    spec:
+      nodeSelector:
+        "kubernetes.io/os": linux
+      containers:
+        - name: ai-service
+          image: ilyaszazai/ai-service-l8:latest
+          ports:
+            - containerPort: 5001
+          env:
+            - name: USE_AZURE_OPENAI
+              value: "False"
+            - name: OPENAI_GPT_MODEL_NAME
+              value: "gpt-4o-mini"
+            - name: OPENAI_DALLE_MODEL_NAME
+              value: "dall-e-3"
+            - name: AZURE_OPENAI_API_VERSION
+              value: "2024-07-01-preview"
+            - name: AZURE_OPENAI_GPT_DEPLOYMENT_NAME
+              value: ""
+            - name: AZURE_OPENAI_GPT_ENDPOINT
+              value: ""
+            - name: AZURE_OPENAI_DALLE_ENDPOINT
+              value: ""
+            - name: AZURE_OPENAI_DALLE_DEPLOYMENT_NAME
+              value: ""
+            - name: OPENAI_GPT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-gpt-api-secret
+                  key: OPENAI_GPT_API_KEY
+            - name: OPENAI_DALLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-dalle-api-secret
+                  key: OPENAI_DALLE_API_KEY
+          resources:
+            requests:
+              cpu: 20m
+              memory: 50Mi
+            limits:
+              cpu: 50m
+              memory: 128Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 60
+            failureThreshold: 3
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 3
+            failureThreshold: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 3
+            failureThreshold: 10
+            periodSeconds: 10
+---
+# Service for AI Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 5001
+      targetPort: 5001
+  selector:
+    app: ai-service
