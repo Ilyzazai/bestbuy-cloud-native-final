@@ -34,8 +34,8 @@ jobs:
           context: ./store-front-L8
           push: true
           tags: |
-            ilyaszazai/store-front-l8:latest
-            ilyaszazai/store-front-l8:${{ github.sha }}
+            ilyaszazai/store-front:latest
+            ilyaszazai/store-front:${{ github.sha }}
 
       - name: Setup kubectl
         uses: Azure/setup-kubectl@v4
@@ -48,7 +48,7 @@ jobs:
 
       - name: Update deployment image
         run: |
-          kubectl set image deployment/store-front store-front=ilyaszazai/store-front-l8:${{ github.sha }}
+          kubectl set image deployment/store-front store-front=ilyaszazai/store-front:${{ github.sha }}
           kubectl rollout status deployment/store-front --timeout=180s
 
       - name: Verify service and pods
