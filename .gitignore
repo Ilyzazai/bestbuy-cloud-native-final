@@ -1,2 +1,8 @@
 
 aks-admin-kubeconfig
+
+# Sensitive files
+Deployment Files/secrets.yaml
+aks-admin-kubeconfig
+.env
+*.env
