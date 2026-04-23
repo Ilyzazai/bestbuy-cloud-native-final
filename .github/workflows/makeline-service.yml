@@ -1,0 +1,58 @@
+name: Makeline-Service CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'makeline-service-L8/**'
+      - '.github/workflows/makeline-service.yml'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push makeline-service image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./makeline-service-L8
+          file: ./makeline-service-L8/Dockerfile
+          push: true
+          tags: |
+            ilyaszazai/makeline-service-l8:latest
+            ilyaszazai/makeline-service-l8:${{ github.sha }}
+
+      - name: Setup kubectl
+        uses: Azure/setup-kubectl@v4
+
+      - name: Set AKS context from kubeconfig
+        uses: Azure/k8s-set-context@v5
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/makeline-service makeline-service=ilyaszazai/makeline-service-l8:${{ github.sha }}
+          kubectl rollout status deployment/makeline-service --timeout=180s
+
+      - name: Verify service and pods
+        run: |
+          kubectl get pods
+          kubectl get svc
