@@ -32,6 +32,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ./store-front-L8
+          file: ./store-front-L8/Dockerfile
           push: true
           tags: |
             ilyaszazai/store-front:latest
